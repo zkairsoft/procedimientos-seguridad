@@ -1,0 +1,372 @@
+package com.ejemplo.asistentevoz;
+
+import android.content.Intent;
+import android.os.AsyncTask;
+import android.os.Build;
+import android.os.Bundle;
+import android.speech.RecognitionListener;
+import android.speech.RecognizerIntent;
+import android.speech.SpeechRecognizer;
+import android.speech.tts.TextToSpeech;
+import android.widget.Button;
+import android.widget.TextView;
+import android.widget.Toast;
+
+import androidx.appcompat.app.AppCompatActivity;
+
+import com.google.gson.Gson;
+import com.google.gson.reflect.TypeToken;
+
+import java.io.BufferedInputStream;
+import java.io.BufferedReader;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.lang.reflect.Type;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.text.Normalizer;
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Locale;
+import java.util.Set;
+
+public class MainActivity extends AppCompatActivity {
+
+    // TODO: Reemplaza con TU URL raw de index.json
+    private static final String URL_INDEX = "https://raw.githubusercontent.com/usuario/repositorio/main/index.json";
+
+    private TextView txtEstado;
+    private Button btnHablar;
+
+    private SpeechRecognizer speechRecognizer;
+    private Intent speechIntent;
+    private TextToSpeech tts;
+
+    private List<Documento> indice = new ArrayList<>();
+
+    // ====== MODELOS ======
+    public static class Documento {
+        public String nombre;
+        public String archivo;  // ruta en repo, ej. "procedimientos/..."
+        public String url;      // URL raw directa al archivo
+        public String ultima_actualizacion;
+    }
+
+    // ====== CICLO DE VIDA ======
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        setContentView(R.layout.activity_main);
+
+        txtEstado = findViewById(R.id.txtEstado);
+        btnHablar = findViewById(R.id.btnHablar);
+
+        inicializarTTS();
+        inicializarSTT();
+        descargarIndice();
+
+        btnHablar.setOnClickListener(v -> iniciarEscucha());
+    }
+
+    @Override
+    protected void onDestroy() {
+        super.onDestroy();
+        if (speechRecognizer != null) speechRecognizer.destroy();
+        if (tts != null) {
+            tts.stop();
+            tts.shutdown();
+        }
+    }
+
+    // ====== INICIALIZACIONES ======
+    private void inicializarTTS() {
+        tts = new TextToSpeech(this, status -> {
+            if (status == TextToSpeech.SUCCESS) {
+                int res = tts.setLanguage(new Locale("es", "ES"));
+                if (res == TextToSpeech.LANG_MISSING_DATA || res == TextToSpeech.LANG_NOT_SUPPORTED) {
+                    toast("TTS español no soportado en este dispositivo");
+                }
+            } else {
+                toast("Error inicializando TTS");
+            }
+        });
+    }
+
+    private void inicializarSTT() {
+        if (!SpeechRecognizer.isRecognitionAvailable(this)) {
+            toast("El reconocimiento de voz no está disponible");
+            return;
+        }
+        speechRecognizer = SpeechRecognizer.createSpeechRecognizer(this);
+        speechIntent = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
+        speechIntent.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);
+        speechIntent.putExtra(RecognizerIntent.EXTRA_LANGUAGE, "es-CL"); // español Chile; cambia si prefieres
+        speechIntent.putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true);
+
+        speechRecognizer.setRecognitionListener(new RecognitionListener() {
+            @Override public void onReadyForSpeech(Bundle params) { setEstado("Escuchando..."); }
+            @Override public void onBeginningOfSpeech() { setEstado("Grabando..."); }
+            @Override public void onRmsChanged(float rmsdB) {}
+            @Override public void onBufferReceived(byte[] buffer) {}
+            @Override public void onEndOfSpeech() { setEstado("Procesando..."); }
+            @Override public void onError(int error) { setEstado("Error de voz: " + error); hablar("No te entendí, ¿puedes repetir?"); }
+            @Override public void onResults(Bundle results) {
+                ArrayList<String> textos = results.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION);
+                if (textos != null && !textos.isEmpty()) {
+                    String consulta = textos.get(0);
+                    setEstado("Consulta: " + consulta);
+                    resolverConsulta(consulta);
+                }
+            }
+            @Override public void onPartialResults(Bundle partialResults) {}
+            @Override public void onEvent(int eventType, Bundle params) {}
+        });
+    }
+
+    // ====== FLUJO: DESCARGA ÍNDICE ======
+    private void descargarIndice() {
+        setEstado("Descargando índice...");
+        new AsyncTask<String, Void, List<Documento>>() {
+            @Override
+            protected List<Documento> doInBackground(String... urls) {
+                try {
+                    URL url = new URL(urls[0]);
+                    HttpURLConnection con = (HttpURLConnection) url.openConnection();
+                    con.connect();
+                    if (con.getResponseCode() != HttpURLConnection.HTTP_OK) return null;
+
+                    InputStream in = con.getInputStream();
+                    BufferedReader br = new BufferedReader(new InputStreamReader(in));
+                    StringBuilder sb = new StringBuilder();
+                    String line;
+                    while ((line = br.readLine()) != null) sb.append(line);
+                    br.close();
+                    String json = sb.toString();
+
+                    Gson gson = new Gson();
+                    Type listType = new TypeToken<List<Documento>>() {}.getType();
+                    return gson.fromJson(json, listType);
+                } catch (Exception e) {
+                    e.printStackTrace();
+                    return null;
+                }
+            }
+            @Override
+            protected void onPostExecute(List<Documento> docs) {
+                if (docs != null) {
+                    indice = docs;
+                    setEstado("Índice listo. Pulsa para preguntar.");
+                    hablar("Índice cargado. ¿Qué procedimiento o norma necesitas?");
+                } else {
+                    setEstado("No se pudo descargar el índice");
+                    hablar("No pude descargar el índice de documentos.");
+                }
+            }
+        }.execute(URL_INDEX);
+    }
+
+    // ====== STT CONTROL ======
+    private void iniciarEscucha() {
+        if (speechRecognizer == null) {
+            toast("STT no disponible"); return;
+        }
+        speechRecognizer.startListening(speechIntent);
+    }
+
+    // ====== RESOLVER CONSULTA ======
+    private void resolverConsulta(String consulta) {
+        if (indice == null || indice.isEmpty()) {
+            hablar("No tengo documentos cargados aún.");
+            return;
+        }
+        Documento mejor = seleccionarDocumento(consulta, indice);
+        if (mejor == null) {
+            hablar("No encontré un documento relacionado."); return;
+        }
+
+        setEstado("Descargando: " + mejor.nombre);
+        descargarDocumento(mejor.url, nombreLocal(mejor.archivo), new OnDocumentoDescargadoListener() {
+            @Override
+            public void onDocumentoDescargado(File archivo) {
+                setEstado("Procesando: " + archivo.getName());
+                if (archivo.getName().toLowerCase().endsWith(".txt")) {
+                    String respuesta = responderDesdeTxt(archivo, consulta);
+                    if (respuesta == null || respuesta.trim().isEmpty()) {
+                        respuesta = "Tengo el documento " + mejor.nombre + ". ¿Quieres que te lea un resumen?";
+                    }
+                    hablar(respuesta);
+                } else if (archivo.getName().toLowerCase().endsWith(".pdf")) {
+                    // Demo: confirmamos descarga. (Abajo te indico cómo parsear PDF)
+                    hablar("Tengo el documento " + mejor.nombre + " en PDF. Puedo buscar palabras clave si lo habilitamos.");
+                } else {
+                    hablar("He descargado " + mejor.nombre + ", pero aún no proceso ese formato.");
+                }
+
+                // Limpieza opcional: borrar archivo temporal
+                // archivo.delete();
+            }
+            @Override
+            public void onError(String error) {
+                setEstado(error);
+                hablar("No pude descargar el documento.");
+            }
+        });
+    }
+
+    // ====== SELECCIÓN DOCUMENTO (similaridad muy simple por palabras clave) ======
+    private Documento seleccionarDocumento(String consulta, List<Documento> docs) {
+        String q = normalizar(consulta);
+        Set<String> tokensQ = tokenizar(q);
+
+        Documento mejor = null;
+        int mejorPuntaje = -1;
+
+        for (Documento d : docs) {
+            String textoTitulo = d.nombre != null ? d.nombre : "";
+            String textoRuta = d.archivo != null ? d.archivo : "";
+            String base = normalizar(textoTitulo + " " + textoRuta);
+            Set<String> tokensD = tokenizar(base);
+
+            int score = interseccion(tokensQ, tokensD);
+            if (score > mejorPuntaje) {
+                mejorPuntaje = score;
+                mejor = d;
+            }
+        }
+        return mejor;
+    }
+
+    private int interseccion(Set<String> a, Set<String> b) {
+        int c = 0;
+        for (String t : a) if (b.contains(t)) c++;
+        return c;
+    }
+
+    private String normalizar(String s) {
+        if (s == null) return "";
+        String n = Normalizer.normalize(s.toLowerCase(Locale.ROOT), Normalizer.Form.NFD)
+                .replaceAll("\\p{InCombiningDiacriticalMarks}+", "");
+        return n.replaceAll("[^a-z0-9ñáéíóúü\\s]", " ");
+    }
+
+    private Set<String> tokenizar(String s) {
+        String[] arr = s.split("\\s+");
+        Set<String> out = new HashSet<>();
+        // stopwords mínimas en español
+        String[] stop = {"el","la","los","las","un","una","unos","unas","de","del","y","o","u","en","para","por","con","a","se","que","al","lo","su","sus"};
+        Set<String> stopset = new HashSet<>();
+        for (String st : stop) stopset.add(st);
+
+        for (String w : arr) {
+            if (w.length() < 2) continue;
+            if (stopset.contains(w)) continue;
+            out.add(w);
+        }
+        return out;
+    }
+
+    private String nombreLocal(String ruta) {
+        if (ruta == null) return "doc.tmp";
+        int p = ruta.lastIndexOf('/');
+        return p >= 0 ? ruta.substring(p + 1) : ruta;
+    }
+
+    // ====== DESCARGA DOCUMENTO ======
+    public interface OnDocumentoDescargadoListener {
+        void onDocumentoDescargado(File archivo);
+        void onError(String error);
+    }
+
+    private void descargarDocumento(String urlArchivo, String nombreArchivo, OnDocumentoDescargadoListener listener) {
+        new AsyncTask<Void, Void, File>() {
+            @Override
+            protected File doInBackground(Void... voids) {
+                try {
+                    URL url = new URL(urlArchivo);
+                    HttpURLConnection connection = (HttpURLConnection) url.openConnection();
+                    connection.connect();
+                    if (connection.getResponseCode() != HttpURLConnection.HTTP_OK) return null;
+
+                    InputStream input = new BufferedInputStream(connection.getInputStream());
+                    File file = new File(getCacheDir(), nombreArchivo);
+                    FileOutputStream output = new FileOutputStream(file);
+                    byte[] data = new byte[4096];
+                    int count;
+                    while ((count = input.read(data)) != -1) {
+                        output.write(data, 0, count);
+                    }
+                    output.flush();
+                    output.close();
+                    input.close();
+                    return file;
+                } catch (Exception e) {
+                    e.printStackTrace();
+                    return null;
+                }
+            }
+            @Override
+            protected void onPostExecute(File file) {
+                if (file != null) listener.onDocumentoDescargado(file);
+                else listener.onError("Error descargando documento");
+            }
+        }.execute();
+    }
+
+    // ====== RESPUESTA DEMO PARA .TXT ======
+    private String responderDesdeTxt(File archivo, String consulta) {
+        try {
+            String q = normalizar(consulta);
+            Set<String> tq = tokenizar(q);
+
+            StringBuilder sb = new StringBuilder();
+            BufferedReader br = new BufferedReader(new InputStreamReader(new FileInputStream(archivo)));
+            String line;
+            int maxLineas = 0;
+            while ((line = br.readLine()) != null) {
+                String ln = normalizar(line);
+                Set<String> tl = tokenizar(ln);
+                int match = interseccion(tq, tl);
+                if (match > 0) {
+                    sb.append(line).append(". ");
+                    maxLineas++;
+                    if (maxLineas >= 3) break; // lee hasta 3 líneas relevantes
+                }
+            }
+            br.close();
+
+            if (sb.length() == 0) {
+                // fallback: primeras 2-3 líneas
+                br = new BufferedReader(new InputStreamReader(new FileInputStream(archivo)));
+                int c = 0;
+                while ((line = br.readLine()) != null && c < 3) {
+                    sb.append(line).append(". ");
+                    c++;
+                }
+                br.close();
+            }
+
+            String resp = sb.toString().trim();
+            if (resp.length() > 400) resp = resp.substring(0, 400) + "...";
+            return resp;
+        } catch (Exception e) {
+            e.printStackTrace();
+            return null;
+        }
+    }
+
+    // ====== UTILIDADES ======
+    private void setEstado(String s) { txtEstado.setText(s); }
+    private void toast(String s) { Toast.makeText(this, s, Toast.LENGTH_SHORT).show(); }
+    private void hablar(String s) {
+        if (tts == null) return;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+            tts.speak(s, TextToSpeech.QUEUE_FLUSH, null, "utt1");
+        } else {
+            tts.speak(s, TextToSpeech.QUEUE_FLUSH, null);
+        }
+    }
+}
